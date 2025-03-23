@@ -7,9 +7,10 @@ import logging
 from datetime import datetime
 import requests
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import List, Tuple
 from dotenv import load_dotenv
 
 from langchain.chains import ConversationalRetrievalChain, LLMChain
@@ -19,43 +20,40 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.prompts.chat import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 from langchain.prompts import PromptTemplate
 
-# -----------------------------------------
-# Logging configuration
-# -----------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# -----------------------------------------
-# Load environment variables
-# -----------------------------------------
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise Exception("OPENAI_API_KEY not set!")
 
-# -----------------------------------------
-# Define the update_patient_diagnosis tool for function calling.
-# -----------------------------------------
-tools = [{
-    "name": "update_patient_diagnosis",
-    "description": "Update patient's diagnostic criteria based on reported symptoms. Requires patient_id and symptoms.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "patient_id": {"type": "integer", "description": "Unique patient identifier"},
-            "symptoms": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "List of observed symptoms in the patient"
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "update_patient_diagnosis",
+            "description": "Update patient's diagnostic criteria based on reported symptoms. Requires patient_id and symptoms.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patient_id": {
+                        "type": "integer",
+                        "description": "Unique patient identifier"
+                    },
+                    "symptoms": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of observed symptoms in the patient"
+                    }
+                },
+                "required": ["patient_id", "symptoms"]
             }
-        },
-        "required": ["patient_id", "symptoms"]
+        }
     }
-}]
+]
 
-# -----------------------------------------
-# Initialize vector database (Chroma) for conversation retrieval.
-# -----------------------------------------
+
 persist_directory = "./chroma_db"
 vector_db = Chroma(
     persist_directory=persist_directory,
@@ -63,9 +61,7 @@ vector_db = Chroma(
 )
 retriever = vector_db.as_retriever(search_kwargs={"k": 5})
 
-# -----------------------------------------
-# Function to fetch patient name from diagnosis.db given patient_id.
-# -----------------------------------------
+
 def get_patient_name(patient_id: int) -> str:
     try:
         with sqlite3.connect('diagnosis.db') as conn:
@@ -76,9 +72,6 @@ def get_patient_name(patient_id: int) -> str:
     except Exception as e:
         return "Unknown"
 
-# -----------------------------------------
-# Initialize (or create) the conversation history database.
-# -----------------------------------------
 def init_conversation_db():
     conn = sqlite3.connect('conversation.db')
     cursor = conn.cursor()
@@ -130,20 +123,60 @@ def parse_conversation_history(conv_str: str):
     history = []
     for line in lines:
         if line.startswith("Psychiatrist:"):
-            content = line.replace("Psychiatrist:", "").trim()
+            content = line.replace("Psychiatrist:", "").strip()
             history.append(("human", content))
         elif line.startswith("Assistant:"):
-            content = line.replace("Assistant:", "").trim()
+            content = line.replace("Assistant:", "").strip()
             history.append(("ai", content))
-        # You can add additional conditions for other roles if needed.
     return history
 
-# Initialize conversation database on startup.
+def update_criteria_logic(patient_id: int, symptoms: List[str]) -> None:
+    logger.info(f"Updating criteria for patient {patient_id} with symptoms: {symptoms}")
+    try:
+        with sqlite3.connect('diagnosis.db') as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, criteria FROM disorders")
+            disorders = cursor.fetchall()
+            
+            # Precompute embeddings for each criterion per disorder.
+            disorder_criteria_embeddings = {}
+            for disorder_id, criteria_json in disorders:
+                try:
+                    criteria_list = json.loads(criteria_json)
+                except Exception as e:
+                    logger.error(f"Error parsing JSON for disorder {disorder_id}: {e}")
+                    continue
+                criterion_embeds = []
+                for criterion in criteria_list:
+                    crit_emb = np.array(OpenAIEmbeddings(model="text-embedding-3-large").embed_query(criterion))
+                    criterion_embeds.append((criterion, crit_emb))
+                disorder_criteria_embeddings[disorder_id] = criterion_embeds
+                logger.info(f"Precomputed embeddings for disorder {disorder_id}")
+            
+            # Process each symptom.
+            for symptom in symptoms:
+                symptom_emb = np.array(OpenAIEmbeddings(model="text-embedding-3-large").embed_query(symptom))
+                for disorder_id, criterion_list in disorder_criteria_embeddings.items():
+                    for criterion, crit_emb in criterion_list:
+                        norm_symptom = np.linalg.norm(symptom_emb)
+                        norm_crit = np.linalg.norm(crit_emb)
+                        if norm_symptom == 0 or norm_crit == 0:
+                            continue
+                        sim = np.dot(symptom_emb, crit_emb) / (norm_symptom * norm_crit)
+                        logger.info(f"Similarity between '{symptom}' and '{criterion}': {sim}")
+                        if sim >= 0.5:  # similarity threshold
+                            cursor.execute('''
+                                INSERT OR REPLACE INTO patient_criteria
+                                (patient_id, disorder_id, criterion, met)
+                                VALUES (?, ?, ?, ?)
+                            ''', (patient_id, disorder_id, criterion, True))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error updating criteria: {e}")
+        raise
+
 init_conversation_db()
 
-# -----------------------------------------
-# Set up LangChain for the conversation.
-# -----------------------------------------
 system_msg = SystemMessagePromptTemplate.from_template(
     "You are a helpful assistant called MindSeek that remembers details from the conversation. "
     "The user is a psychiatrist, not the patient. Always refer to the patient using the provided patient details. "
@@ -151,7 +184,8 @@ system_msg = SystemMessagePromptTemplate.from_template(
     "Your hobby is helping, and you strive to provide accurate and helpful information. "
     "You are augmented with external knowledge sources, especially from the DSM-5. "
     "If DSM-5 does not provide an answer, use general mental health knowledge to help the user. "
-    "When the user provides any symptoms, you MUST automatically call the update_patient_diagnosis function to update the patient's diagnostic criteria. "
+    "When the user provides any symptoms, you MUST automatically call the update_patient_diagnosis function to update the patient's diagnostic criteria."
+    "You must also call the update_patient_diagnosis function if the user talks about patient reporting/having experienced symptoms."
     "Also, if the user asks about the patient's name, provide it. "
     "Remember: The user is a psychiatrist seeking assistance with their patient's case."
     "Please ALWAYS output your answer in Markdown format. MAKE SURE it's PROPERLY FORMATTED."
@@ -172,8 +206,8 @@ qa_prompt = ChatPromptTemplate.from_messages([system_msg, human_msg])
 llm = ChatOpenAI(
     model_name="gpt-4o", 
     temperature=0.7,
-    functions=tools,
-    function_call="auto"
+    tools=tools,  
+    tool_choice= "auto"
 )
 
 condense_prompt = PromptTemplate(
@@ -187,9 +221,6 @@ condense_prompt = PromptTemplate(
     )
 )
 question_generator_chain = LLMChain(llm=llm, prompt=condense_prompt)
-
-# Remove in-memory conversation memory to avoid cross-user leakage.
-# Instead, we always load the full conversation history from SQLite.
 qa_chain = load_qa_chain(llm, chain_type="stuff", prompt=qa_prompt)
 
 conversational_chain = ConversationalRetrievalChain(
@@ -212,9 +243,6 @@ relevance_prompt = PromptTemplate(
 )
 relevance_chain = LLMChain(llm=llm, prompt=relevance_prompt)
 
-# -----------------------------------------
-# Diagnosis Database Initialization (for disorders, patients, criteria).
-# -----------------------------------------
 def init_diagnosis_db():
     try:
         with sqlite3.connect('diagnosis.db') as conn:
@@ -223,6 +251,9 @@ def init_diagnosis_db():
                 CREATE TABLE IF NOT EXISTS disorders
                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
                  name TEXT NOT NULL,
+                 code TEXT,
+                 cluster TEXT,
+                 description TEXT,
                  criteria TEXT NOT NULL)
             ''')
             cursor.execute('''
@@ -244,26 +275,47 @@ def init_diagnosis_db():
             count = cursor.fetchone()[0]
             if count == 0:
                 sample_disorders = [
-                    ("Major Depressive Disorder", [
-                        "Depressed mood", 
-                        "Markedly diminished interest", 
-                        "Significant weight change", 
-                        "Insomnia or hypersomnia", 
-                        "Fatigue or loss of energy", 
-                        "Feelings of worthlessness"
-                    ]),
-                    ("Bipolar I Disorder", [
-                        "At least one manic episode", 
-                        "Inflated self-esteem or grandiosity", 
-                        "Decreased need for sleep", 
-                        "More talkative than usual", 
-                        "Flight of ideas", 
-                        "Increase in goal-directed activity"
-                    ])
+                    (
+                        "Borderline Personality Disorder", "F60.3", "Personality Disorder (Cluster B)",
+                        "Marked by emotional dysregulation, impulsivity, and unstable interpersonal relationships. It involves identity disturbance, fear of abandonment, and recurrent self-harm or suicidality. Treatment focuses on DBT and mood stabilization.",
+                        [
+                            "Frantic efforts to avoid real or imagined abandonment.",
+                            "A pattern of unstable and intense interpersonal relationships characterized by alternating between extremes of idealization and devaluation.",
+                            "Impulsivity in at least two areas that are potentially self-damaging.",
+                            "Recurrent suicidal behavior, gestures, or threats, or self-mutilating behavior."
+                        ]
+                    ),
+                    (
+                        "Major Depressive Disorder", None, None,
+                        "A mood disorder causing persistent feelings of sadness and loss of interest.",
+                        [
+                            "Depressed mood",
+                            "Markedly diminished interest",
+                            "Significant weight change",
+                            "Insomnia or hypersomnia",
+                            "Fatigue or loss of energy",
+                            "Feelings of worthlessness"
+                        ]
+                    ),
+                    (
+                        "Bipolar I Disorder", None, None,
+                        "A mood disorder characterized by manic episodes and depressive episodes.",
+                        [
+                            "At least one manic episode",
+                            "Inflated self-esteem or grandiosity",
+                            "Decreased need for sleep",
+                            "More talkative than usual",
+                            "Flight of ideas",
+                            "Increase in goal-directed activity"
+                        ]
+                    )
                 ]
-                for name, criteria in sample_disorders:
-                    cursor.execute("INSERT INTO disorders (name, criteria) VALUES (?, ?)",
-                                   (name, json.dumps(criteria)))
+                for disorder in sample_disorders:
+                    name, code, cluster, description, criteria = disorder
+                    cursor.execute(
+                        "INSERT INTO disorders (name, code, cluster, description, criteria) VALUES (?, ?, ?, ?, ?)",
+                        (name, code, cluster, description, json.dumps(criteria))
+                    )
             conn.commit()
             logger.info("Diagnosis database initialized successfully.")
     except Exception as e:
@@ -271,9 +323,6 @@ def init_diagnosis_db():
 
 init_diagnosis_db()
 
-# -----------------------------------------
-# Pydantic models for Diagnosis API.
-# -----------------------------------------
 class SymptomUpdate(BaseModel):
     patient_id: int
     symptoms: list[str]
@@ -281,9 +330,6 @@ class SymptomUpdate(BaseModel):
 class PatientCreate(BaseModel):
     name: str
 
-# -----------------------------------------
-# Pydantic models for Conversation API.
-# -----------------------------------------
 class MessageRequest(BaseModel):
     message: str
     patient_id: int
@@ -293,15 +339,13 @@ class MessageResponse(BaseModel):
     answer: str
     retrieval_info: str = ""
 
-# -----------------------------------------
-# Create FastAPI app and endpoints.
-# -----------------------------------------
+
 app = FastAPI(title="Integrated Diagnosis and Conversation API",
               description="API for managing diagnosis and conversation for mental health.")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict to your frontend's domain.
+    allow_origins=["*"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -324,81 +368,15 @@ async def create_patient(patient: PatientCreate):
 
 @app.post("/update_criteria")
 async def update_criteria(update: SymptomUpdate):
-    logger.info(f"Updating criteria for patient {update.patient_id}")
-    logger.info(f"Symptoms: {update.symptoms}")
     try:
-        with sqlite3.connect('diagnosis.db') as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, criteria FROM disorders")
-            disorders = cursor.fetchall()
-            
-            # Precompute embeddings for each criterion per disorder
-            disorder_criteria_embeddings = {}
-            for disorder_id, criteria_json in disorders:
-                try:
-                    criteria_list = json.loads(criteria_json)
-                except Exception as e:
-                    logger.error(f"Error parsing JSON for disorder {disorder_id}: {e}")
-                    continue  # Skip if JSON parsing fails
-                criterion_embeds = []
-                for criterion in criteria_list:
-                    crit_emb = np.array(OpenAIEmbeddings(model="text-embedding-3-large").embed_query(criterion))
-                    criterion_embeds.append((criterion, crit_emb))
-                disorder_criteria_embeddings[disorder_id] = criterion_embeds
-                logger.info(f"Precomputed embeddings for disorder {disorder_id}")
-            
-            # Process each symptom provided by the user.
-            for symptom in update.symptoms:
-                symptom_emb = np.array(OpenAIEmbeddings(model="text-embedding-3-large").embed_query(symptom))
-                for disorder_id, criterion_list in disorder_criteria_embeddings.items():
-                    for criterion, crit_emb in criterion_list:
-                        norm_symptom = np.linalg.norm(symptom_emb)
-                        norm_crit = np.linalg.norm(crit_emb)
-                        if norm_symptom == 0 or norm_crit == 0:
-                            continue
-                        sim = np.dot(symptom_emb, crit_emb) / (norm_symptom * norm_crit)
-                        logger.info(f"Similarity between '{symptom}' and '{criterion}': {sim}")
-                        if sim >= 0.5:  # SIMILARITY_THRESHOLD is 0.5
-                            cursor.execute('''
-                                INSERT OR REPLACE INTO patient_criteria
-                                (patient_id, disorder_id, criterion, met)
-                                VALUES (?, ?, ?, ?)
-                            ''', (update.patient_id, disorder_id, criterion, True))
-            conn.commit()
-            return {"status": "updated"}
+        update_criteria_logic(update.patient_id, update.symptoms)
+        return {"status": "updated"}
     except Exception as e:
         logger.error(f"Error updating criteria: {e}")
         raise HTTPException(status_code=500, detail="Error updating criteria")
 
-@app.get("/diagnosis_summary")
-async def diagnosis_summary(patient_id: int):
-    try:
-        with sqlite3.connect('diagnosis.db') as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT d.name, pc.criterion
-                FROM patient_criteria pc
-                JOIN disorders d ON d.id = pc.disorder_id
-                WHERE pc.patient_id = ? AND pc.met = 1
-            ''', (patient_id,))
-            rows = cursor.fetchall()
-            if not rows:
-                raise HTTPException(status_code=404, detail="No diagnosis data found for this patient")
-            summary = {}
-            for disorder_name, criterion in rows:
-                summary.setdefault(disorder_name, []).append(criterion)
-            logger.info(f"Diagnosis summary for patient {patient_id}: {summary}")
-            return {"patient_id": patient_id, "diagnosis_summary": summary}
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        logger.error(f"Error retrieving diagnosis summary: {e}")
-        raise HTTPException(status_code=500, detail="Error retrieving diagnosis summary")
-
-# ----- Conversation Endpoint -----
 @app.post("/api/message", response_model=MessageResponse)
 async def handle_message(req: MessageRequest):
-    print(req)
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     patient_id = req.patient_id
     patient_name = get_patient_name(patient_id) if patient_id else "Unknown"
@@ -407,36 +385,48 @@ async def handle_message(req: MessageRequest):
 
     # Store the user's message in the conversation history.
     store_message(patient_id, "Psychiatrist", user_query)
-
-    # Load the full conversation history from SQLite.
     const_history = load_conversation_history(patient_id) if patient_id else ""
-    # Parse the conversation history into structured format:
     parsed_history = parse_conversation_history(const_history)
 
-    # Process the message with the LLM.
-    raw_response = llm.invoke(user_query)
-    function_call = raw_response.additional_kwargs.get("function_call")
-    
-    if function_call and function_call.get("name") == "update_patient_diagnosis":
+    # Prepare prompt input for LangChain.
+    prompt_input = {
+        "chat_history": parsed_history,
+        "question": user_query,
+        "current_time": current_time,
+        "context": f"Patient ID: {patient_id}, Patient Name: {patient_name}",
+        "patient_id": patient_id or "unknown",
+        "patient_name": patient_name,
+        "psychiatrist_name": psychiatrist_name,
+    }
+    formatted_prompt = qa_prompt.format(**prompt_input)
+    raw_response = llm.invoke(formatted_prompt, tools=tools, tool_choice="auto")
+    logger.info(f"LLM raw response: {raw_response}")
+
+    tool_calls = raw_response.additional_kwargs.get("tool_calls", [])
+    function_name = tool_calls[0]["function"]["name"] if tool_calls else None
+
+    if function_name == "update_patient_diagnosis":
         try:
-            args = json.loads(function_call.get("arguments", "{}"))
-            patient_id = args.get("patient_id") or patient_id
-            if patient_id is None:
-                raise ValueError("Patient ID is not provided.")
-            response = requests.post(
-                "http://localhost:8000/update_criteria",
-                json={"patient_id": patient_id, "symptoms": args["symptoms"]}
-            )
+            args = json.loads(tool_calls[0].get("function", {}).get("arguments", "{}"))
+            pid = args.get("patient_id", patient_id)
+            symptoms = args.get("symptoms")
+            if pid is None or not symptoms:
+                raise ValueError("Patient ID or symptoms not provided.")
+            # Call the update logic directly (synchronously)
+            update_criteria_logic(pid, symptoms)
+            # Retrieve updated diagnosis info.
             with sqlite3.connect('diagnosis.db') as conn:
                 cursor = conn.cursor()
-                cursor.execute('''SELECT d.name, COUNT(pc.criterion) as met_count 
-                                  FROM patient_criteria pc
-                                  JOIN disorders d ON pc.disorder_id = d.id
-                                  WHERE pc.patient_id = ?
-                                  GROUP BY d.id''', (patient_id,))
+                cursor.execute('''
+                    SELECT d.name, COUNT(pc.criterion) as met_count 
+                    FROM patient_criteria pc
+                    JOIN disorders d ON pc.disorder_id = d.id
+                    WHERE pc.patient_id = ?
+                    GROUP BY d.id
+                ''', (pid,))
                 diagnoses = cursor.fetchall()
             diagnosis_text = "\n".join([f"{name}: {count} criteria met" for name, count in diagnoses])
-            answer = f"Diagnostic criteria updated. \nCurrent matches:\n{diagnosis_text}"
+            answer = f"Diagnostic criteria updated.\nCurrent matches:\n{diagnosis_text}"
             retrieval_info = ""
         except Exception as e:
             answer = f"Error updating diagnosis: {str(e)}"
@@ -479,8 +469,8 @@ async def handle_message(req: MessageRequest):
         else:
             answer = qa_chain.run({
                 "chat_history": parsed_history,
-                "patient_id": patient_id,      
-                "patient_name": patient_name,  
+                "patient_id": patient_id,
+                "patient_name": patient_name,
                 "psychiatrist_name": psychiatrist_name,
                 "context": "",
                 "question": user_query,
@@ -489,34 +479,49 @@ async def handle_message(req: MessageRequest):
             })
             retrieval_info = "None"
 
-    # Store the assistant's response in the conversation history.
     store_message(patient_id, "Assistant", answer)
-
-    print(answer)
-
     return MessageResponse(answer=answer, retrieval_info=retrieval_info)
 
-# Helper: Parse conversation history string to structured list.
-def parse_conversation_history(conv_str: str):
-    """
-    Converts a conversation history string like:
-      "Psychiatrist: Hi\nAssistant: Hello, how can I help?\nPsychiatrist: What is NPD?"
-    into a list of tuples: [("human", "Hi"), ("ai", "Hello, how can I help?"), ("human", "What is NPD?")]
-    """
-    lines = conv_str.strip().split("\n")
-    parsed = []
-    for line in lines:
-        if line.startswith("Psychiatrist:"):
-            content = line.replace("Psychiatrist:", "").strip()
-            parsed.append(("human", content))
-        elif line.startswith("Assistant:"):
-            content = line.replace("Assistant:", "").strip()
-            parsed.append(("ai", content))
-    return parsed
+@app.get("/diagnosis_summary")
+async def diagnosis_summary(patient_id: int):
+    try:
+        with sqlite3.connect('diagnosis.db') as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, name, code, cluster, description, criteria 
+                FROM disorders
+            ''')
+            disorders = cursor.fetchall()
+            
+            diagnosis_list = []
+            for disorder in disorders:
+                disorder_id, name, code, cluster, description, criteria_json = disorder
+                criteria_list = json.loads(criteria_json)
+                cursor.execute('''
+                    SELECT criterion 
+                    FROM patient_criteria 
+                    WHERE patient_id = ? AND disorder_id = ? AND met = 1
+                ''', (patient_id, disorder_id))
+                met_rows = cursor.fetchall()
+                met_criteria = { row[0] for row in met_rows }
+                if met_criteria:
+                    symptom_objs = [
+                        {"message": crit, "isGood": (crit in met_criteria)}
+                        for crit in criteria_list
+                    ]
+                    diagnosis_list.append({
+                        "name": name,
+                        "code": code,
+                        "cluster": cluster,
+                        "description": description,
+                        "symptoms": symptom_objs
+                    })
+            has_data = len(diagnosis_list) > 0
+            return {"patient_id": patient_id, "hasData": has_data, "diagnosis_summary": diagnosis_list}
+    except Exception as e:
+        logger.error(f"Error retrieving diagnosis summary: {e}")
+        raise HTTPException(status_code=500, detail="Error retrieving diagnosis summary")
 
-# -----------------------------------------
-# Run the app with Uvicorn if executed directly.
-# -----------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
