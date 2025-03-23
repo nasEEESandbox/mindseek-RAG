@@ -53,7 +53,6 @@ tools = [
     }
 ]
 
-
 persist_directory = "./chroma_db"
 vector_db = Chroma(
     persist_directory=persist_directory,
@@ -315,9 +314,6 @@ init_diagnosis_db()
 class SymptomUpdate(BaseModel):
     patient_id: int
     symptoms: list[str]
-
-class PatientCreate(BaseModel):
-    name: str
 
 class MessageRequest(BaseModel):
     message: str
