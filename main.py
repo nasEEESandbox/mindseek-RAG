@@ -61,17 +61,6 @@ vector_db = Chroma(
 )
 retriever = vector_db.as_retriever(search_kwargs={"k": 5})
 
-
-def get_patient_name(patient_id: int) -> str:
-    try:
-        with sqlite3.connect('diagnosis.db') as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM patients WHERE id = ?", (patient_id,))
-            result = cursor.fetchone()
-            return result[0] if result else "Unknown"
-    except Exception as e:
-        return "Unknown"
-
 def init_conversation_db():
     conn = sqlite3.connect('conversation.db')
     cursor = conn.cursor()
@@ -333,7 +322,8 @@ class PatientCreate(BaseModel):
 class MessageRequest(BaseModel):
     message: str
     patient_id: int
-    psychiatrist_name: str = "Unknown"
+    patient_name: str
+    psychiatrist_name: str
 
 class MessageResponse(BaseModel):
     answer: str
@@ -351,21 +341,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----- Diagnosis Endpoints -----
-@app.post("/create_patient")
-async def create_patient(patient: PatientCreate):
-    try:
-        with sqlite3.connect('diagnosis.db') as conn:
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO patients (name) VALUES (?)", (patient.name,))
-            conn.commit()
-            patient_id = cursor.lastrowid
-            logger.info(f"Created patient {patient_id} with name {patient.name}")
-            return {"patient_id": patient_id}
-    except Exception as e:
-        logger.error(f"Error creating patient: {e}")
-        raise HTTPException(status_code=500, detail="Error creating patient")
-
 @app.post("/update_criteria")
 async def update_criteria(update: SymptomUpdate):
     try:
@@ -379,7 +354,7 @@ async def update_criteria(update: SymptomUpdate):
 async def handle_message(req: MessageRequest):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     patient_id = req.patient_id
-    patient_name = get_patient_name(patient_id) if patient_id else "Unknown"
+    patient_name = req.patient_name 
     psychiatrist_name = req.psychiatrist_name or "Unknown"
     user_query = req.message
 
@@ -388,7 +363,6 @@ async def handle_message(req: MessageRequest):
     const_history = load_conversation_history(patient_id) if patient_id else ""
     parsed_history = parse_conversation_history(const_history)
 
-    # Prepare prompt input for LangChain.
     prompt_input = {
         "chat_history": parsed_history,
         "question": user_query,
